@@ -39,6 +39,11 @@ def _make_hermes_tree(root: Path) -> None:
     (root / "cron").mkdir(exist_ok=True)
     (root / "cron" / "jobs.json").write_text("[]")
 
+    # State snapshots are quick rollback caches and should be excluded.
+    (root / "state-snapshots").mkdir(exist_ok=True)
+    (root / "state-snapshots" / "20260523-070100-pre-update").mkdir()
+    (root / "state-snapshots" / "20260523-070100-pre-update" / "state.db").write_bytes(b"snapshot-state")
+
     # Memories
     (root / "memories").mkdir(exist_ok=True)
     (root / "memories" / "notes.json").write_text("{}")
@@ -102,6 +107,11 @@ class TestShouldExclude:
         """backups/ is excluded so pre-update backups don't nest exponentially."""
         from hermes_cli.backup import _should_exclude
         assert _should_exclude(Path("backups/pre-update-2026-04-27-063400.zip"))
+
+    def test_excludes_state_snapshots_dir(self):
+        """state-snapshots/ stores rollback caches that can dwarf update backups."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("state-snapshots/20260523-070100-pre-update/state.db"))
 
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
@@ -198,6 +208,26 @@ class TestBackup:
             names = zf.namelist()
             agent_files = [n for n in names if "hermes-agent" in n]
             assert agent_files == [], f"hermes-agent files leaked into backup: {agent_files}"
+
+    def test_excludes_state_snapshots(self, tmp_path, monkeypatch):
+        """Backup does NOT include state-snapshots/ rollback cache directories."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out_zip = tmp_path / "backup.zip"
+        args = Namespace(output=str(out_zip))
+
+        from hermes_cli.backup import run_backup
+        run_backup(args)
+
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            names = zf.namelist()
+            snapshot_files = [n for n in names if n.startswith("state-snapshots/")]
+            assert snapshot_files == [], f"state snapshot files leaked into backup: {snapshot_files}"
 
     def test_excludes_pycache(self, tmp_path, monkeypatch):
         """Backup does NOT include __pycache__ dirs."""

@@ -37,6 +37,7 @@ _EXCLUDED_DIRS = {
     ".git",             # nested git dirs (profiles shouldn't have these, but safety)
     "node_modules",     # js deps if website/ somehow leaks in
     "backups",          # prior auto-backups — don't nest backups exponentially
+    "state-snapshots",  # quick rollback caches — avoid nesting giant state.db snapshots
     "checkpoints",      # session-local trajectory caches — regenerated per-session,
                         # session-hash-keyed so they don't port to another machine anyway
 }
