@@ -9689,6 +9689,27 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        # A bare A/B/C/D is a decision only when this exact Telegram route has
+        # a delivered Approval Packet. Otherwise it remains an ordinary user
+        # message and follows the existing batching/agent path unchanged.
+        from gateway.kanban_approvals import handle_approval_reply
+
+        decision_output = await asyncio.to_thread(
+            handle_approval_reply,
+            event.text,
+            source=event.source,
+            reply_to_message_id=event.reply_to_message_id,
+        )
+        if decision_output is not None:
+            decision_metadata = {}
+            if getattr(event.source, "thread_id", None):
+                decision_metadata["thread_id"] = event.source.thread_id
+            await self.send(
+                str(event.source.chat_id),
+                decision_output,
+                metadata=decision_metadata or None,
+            )
+            return
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

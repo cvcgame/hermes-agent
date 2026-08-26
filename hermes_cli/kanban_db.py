@@ -1514,6 +1514,57 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- One immutable, sanitized human-decision packet per actionable block event.
+-- Public created_at/generation freshness lives in packet_json; freshness_token
+-- is the private mutation authorizer. Decision receipt and delivery/readback
+-- live in separate columns/tables so notification is never mistaken for consent.
+CREATE TABLE IF NOT EXISTS approval_packets (
+    packet_id            TEXT PRIMARY KEY,
+    task_id              TEXT NOT NULL,
+    event_id             INTEGER NOT NULL UNIQUE,
+    event_kind           TEXT NOT NULL,
+    board_slug           TEXT NOT NULL,
+    packet_json          TEXT NOT NULL,
+    freshness_token      TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'open',
+    created_at           INTEGER NOT NULL,
+    card_path            TEXT,
+    decision_choice      TEXT,
+    decision_actor       TEXT,
+    decision_received_at INTEGER,
+    UNIQUE (task_id, event_id)
+);
+
+CREATE TABLE IF NOT EXISTS approval_deliveries (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    packet_id        TEXT NOT NULL,
+    platform         TEXT NOT NULL,
+    chat_id          TEXT NOT NULL,
+    thread_id        TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL,
+    text_message_id  TEXT,
+    media_status     TEXT,
+    media_message_id TEXT,
+    delivered_at     INTEGER,
+    read_at          INTEGER,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE (packet_id, platform, chat_id, thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS approval_decision_audit (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    packet_id       TEXT,
+    task_id         TEXT,
+    choice          TEXT,
+    actor           TEXT,
+    platform        TEXT,
+    chat_id         TEXT,
+    freshness_token TEXT,
+    accepted        INTEGER NOT NULL,
+    reason          TEXT NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1524,6 +1575,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_approval_task          ON approval_packets(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_approval_delivery_ctx  ON approval_deliveries(platform, chat_id, thread_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_approval_audit_task    ON approval_decision_audit(task_id, created_at);
 """
 
 
@@ -4304,7 +4358,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
@@ -4314,11 +4368,898 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    return int(cur.lastrowid or 0)
+
+
+def _create_approval_packet_for_event(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: int,
+    event_kind: str,
+    reason: str,
+    block_kind: Optional[str],
+    board_slug: Optional[str],
+    approval: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build and insert the one Approval Packet v1 for an actionable event.
+
+    Called inside ``block_task``'s existing write transaction.  The UNIQUE
+    event constraint makes retries idempotent, while validation/redaction
+    failure rolls the task transition back instead of persisting a
+    context-free human block.
+    """
+    from hermes_cli.approval_packets import (
+        build_approval_packet,
+        new_approval_authorizer,
+    )
+
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"unknown task {task_id}")
+    comments = [
+        {"id": item.id, "author": item.author, "body": item.body}
+        for item in list_comments(conn, task_id)[-3:]
+    ]
+    attachments = [
+        {
+            "id": item.id,
+            "filename": item.filename,
+            "content_type": item.content_type,
+            "size": item.size,
+        }
+        for item in list_attachments(conn, task_id)[-12:]
+    ]
+    graph = task_graph_context(conn, task_id)
+    dependents = [
+        {
+            "task_id": item["id"],
+            "title": item["title"],
+            "status": item["status"],
+        }
+        for item in graph.get("children", [])
+        if item.get("status") not in ("done", "archived")
+    ]
+    generation = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM approval_packets WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+    ) + 1
+    packet = build_approval_packet(
+        task_id=task_id,
+        board_slug=board_slug or get_current_board(),
+        title=task.title,
+        reason=reason,
+        block_kind=block_kind,
+        event_id=event_id,
+        event_kind=event_kind,
+        approval=approval,
+        comments=comments,
+        attachments=attachments,
+        dependents=dependents,
+        generation=generation,
+    )
+    # This nonce is a mutation authorizer, not public freshness evidence.  It
+    # is generated only after the sanitized packet has been constructed and
+    # remains confined to the internal approval_packets row and audit digests.
+    mutation_authorizer = new_approval_authorizer()
+    card_path: Optional[str] = None
+    try:
+        from hermes_cli.approval_packets import render_approval_card
+
+        db_row = conn.execute("PRAGMA database_list").fetchone()
+        db_file = Path(db_row["file"]) if db_row and db_row["file"] else kanban_db_path(board_slug)
+        card_path = render_approval_card(
+            packet,
+            db_file.parent / "approval_cards" / f"{packet['packet_id']}.png",
+        )
+    except Exception as exc:
+        # Packet text is mandatory and already built.  Media is additive; a
+        # renderer/filesystem failure must not recreate the old context-free
+        # notification behavior or prevent the task from blocking safely.
+        _log.warning("approval card render failed for %s: %s", task_id, exc)
+    # A newer actionable event invalidates any still-open earlier packet for
+    # this task.  History remains readable and auditable.
+    conn.execute(
+        "UPDATE approval_packets SET status = 'superseded' "
+        "WHERE task_id = ? AND status = 'open'",
+        (task_id,),
+    )
+    conn.execute(
+        """
+        INSERT INTO approval_packets (
+            packet_id, task_id, event_id, event_kind, board_slug,
+            packet_json, freshness_token, status, created_at, card_path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+        """,
+        (
+            packet["packet_id"],
+            task_id,
+            int(event_id),
+            event_kind,
+            packet["board_slug"],
+            json.dumps(packet, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            mutation_authorizer,
+            int(packet["freshness"]["created_at"]),
+            card_path,
+        ),
+    )
+    return packet
+
+
+def list_approval_packets(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Return strictly parsed approval packets with durable provenance."""
+    from hermes_cli.approval_packets import parse_approval_packet
+
+    sql = "SELECT * FROM approval_packets"
+    params: tuple[Any, ...] = ()
+    if task_id is not None:
+        sql += " WHERE task_id = ?"
+        params = (task_id,)
+    sql += " ORDER BY created_at ASC, event_id ASC"
+    out: list[dict[str, Any]] = []
+    for row in conn.execute(sql, params).fetchall():
+        packet = parse_approval_packet(row["packet_json"])
+        packet["provenance"] = {
+            "event_id": int(row["event_id"]),
+            "event_kind": row["event_kind"],
+            "status": row["status"],
+            "card_path": row["card_path"],
+            "decision": (
+                {
+                    "choice": row["decision_choice"],
+                    "actor": row["decision_actor"],
+                    "received_at": row["decision_received_at"],
+                }
+                if row["decision_choice"]
+                else None
+            ),
+        }
+        out.append(packet)
+    return out
+
+
+def get_active_approval_packet(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    packets = list_approval_packets(conn, task_id=task_id)
+    for packet in reversed(packets):
+        if packet["provenance"]["status"] == "open":
+            return packet
+    return None
+
+
+def has_current_decomposition_intent(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether ``task_id`` has current, explicit fan-out consent.
+
+    This is a read-only transaction primitive: callers that own a write
+    transaction can use it immediately before mutation without nesting a new
+    transaction. Every durable link must agree -- triage state, newest decided
+    packet, strict public packet generation, decision choice, and the matching
+    intent event -- otherwise authorization fails closed.
+    """
+    task = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None or task["status"] != "triage":
+        return False
+
+    row = conn.execute(
+        "SELECT packet_id, task_id, packet_json, status, decision_choice "
+        "FROM approval_packets WHERE task_id = ? "
+        "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["status"] != "decided"
+        or row["decision_choice"] not in ("A", "B", "C", "D")
+    ):
+        return False
+
+    try:
+        from hermes_cli.approval_packets import parse_approval_packet
+
+        packet = parse_approval_packet(row["packet_json"])
+        generation = packet["freshness"]["generation"]
+    except (KeyError, TypeError, ValueError):
+        return False
+    if (
+        packet.get("packet_id") != row["packet_id"]
+        or packet.get("task_id") != task_id
+        or row["task_id"] != task_id
+        or row["decision_choice"] not in {
+            choice["id"] for choice in packet["choices"]
+        }
+    ):
+        return False
+
+    events = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'decomposition_requested' "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for event in events:
+        try:
+            payload = json.loads(event["payload"])
+        except (TypeError, ValueError):
+            continue
+        if type(payload) is not dict or set(payload) != {
+            "packet_id",
+            "generation",
+            "choice",
+        }:
+            continue
+        event_generation = payload.get("generation")
+        if (
+            payload.get("packet_id") == row["packet_id"]
+            and not isinstance(event_generation, bool)
+            and isinstance(event_generation, int)
+            and event_generation == generation
+            and payload.get("choice") == row["decision_choice"]
+        ):
+            return True
+    return False
+
+
+def begin_approval_delivery(
+    conn: sqlite3.Connection,
+    *,
+    packet_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Atomically claim one packet/destination delivery.
+
+    Delivered and live in-flight rows dedupe.  Failed or abandoned claims
+    older than five minutes may be reclaimed without creating another row.
+    """
+    now = int(time.time())
+    route = (packet_id, platform.lower(), str(chat_id), thread_id or "")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, updated_at FROM approval_deliveries "
+            "WHERE packet_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            route,
+        ).fetchone()
+        if row is None:
+            try:
+                conn.execute(
+                    "INSERT INTO approval_deliveries "
+                    "(packet_id, platform, chat_id, thread_id, status, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'sending', ?)",
+                    (*route, now),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+        if row["status"] == "delivered":
+            return False
+        if row["status"] == "sending" and int(row["updated_at"] or 0) > now - 300:
+            return False
+        conn.execute(
+            "UPDATE approval_deliveries SET status = 'sending', updated_at = ? "
+            "WHERE packet_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (now, *route),
+        )
+        return True
+
+
+def finish_approval_delivery(
+    conn: sqlite3.Connection,
+    *,
+    packet_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    text_message_id: Optional[str] = None,
+    media_status: Optional[str] = None,
+    media_message_id: Optional[str] = None,
+) -> None:
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE approval_deliveries SET status = 'delivered', "
+            "text_message_id = ?, media_status = ?, media_message_id = ?, "
+            "delivered_at = COALESCE(delivered_at, ?), updated_at = ? "
+            "WHERE packet_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (
+                str(text_message_id) if text_message_id else None,
+                media_status,
+                str(media_message_id) if media_message_id else None,
+                now,
+                now,
+                packet_id,
+                platform.lower(),
+                str(chat_id),
+                thread_id or "",
+            ),
+        )
+
+
+def fail_approval_delivery(
+    conn: sqlite3.Connection,
+    *,
+    packet_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> None:
+    del reason  # failure detail belongs in bounded application logs, not PII-bearing rows
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE approval_deliveries SET status = 'failed', updated_at = ? "
+            "WHERE packet_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (int(time.time()), packet_id, platform.lower(), str(chat_id), thread_id or ""),
+        )
+
+
+def mark_approval_read(
+    conn: sqlite3.Connection,
+    *,
+    packet_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE approval_deliveries SET read_at = COALESCE(read_at, ?), updated_at = ? "
+            "WHERE packet_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND status = 'delivered'",
+            (now, now, packet_id, platform.lower(), str(chat_id), thread_id or ""),
+        )
+    return cur.rowcount == 1
+
+
+def list_approval_deliveries(
+    conn: sqlite3.Connection,
+    *,
+    packet_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM approval_deliveries"
+    params: tuple[Any, ...] = ()
+    if packet_id is not None:
+        sql += " WHERE packet_id = ?"
+        params = (packet_id,)
+    sql += " ORDER BY id ASC"
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def find_approval_delivery_contexts(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    reply_to_message_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Return up to two packets delivered on an exact reply route.
+
+    Two rows are enough for callers to distinguish an unambiguous standalone
+    decision from a route with multiple delivered generations.  When a reply
+    anchor is supplied, only a text or media delivery with that exact message
+    id can match.  Superseded rows remain resolvable so an old anchored reply
+    is rejected and audited against the old packet instead of retargeted.
+    """
+    from hermes_cli.approval_packets import parse_approval_packet
+
+    sql = (
+        "SELECT p.*, d.status AS delivery_status, d.delivered_at, d.read_at, "
+        "d.text_message_id, d.media_status, d.media_message_id "
+        "FROM approval_deliveries d "
+        "JOIN approval_packets p ON p.packet_id = d.packet_id "
+        "WHERE d.platform = ? AND d.chat_id = ? AND d.thread_id = ? "
+        "AND d.status = 'delivered' "
+    )
+    params: list[Any] = [platform.lower(), str(chat_id), thread_id or ""]
+    if task_id is not None:
+        sql += "AND p.task_id = ? "
+        params.append(task_id)
+    if reply_to_message_id is not None:
+        sql += "AND (d.text_message_id = ? OR d.media_message_id = ?) "
+        anchor = str(reply_to_message_id)
+        params.extend((anchor, anchor))
+    sql += "ORDER BY d.delivered_at DESC, d.id DESC LIMIT 2"
+
+    contexts: list[dict[str, Any]] = []
+    for row in conn.execute(sql, params).fetchall():
+        packet = parse_approval_packet(row["packet_json"])
+        packet["provenance"] = {
+            "event_id": int(row["event_id"]),
+            "event_kind": row["event_kind"],
+            "status": row["status"],
+            "card_path": row["card_path"],
+        }
+        packet["delivery"] = {
+            "status": row["delivery_status"],
+            "delivered_at": row["delivered_at"],
+            "read_at": row["read_at"],
+            "text_message_id": row["text_message_id"],
+            "media_status": row["media_status"],
+            "media_message_id": row["media_message_id"],
+        }
+        contexts.append(packet)
+    return contexts
+
+
+def find_approval_delivery_context(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    reply_to_message_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Return the newest packet delivered to a route, if any."""
+    contexts = find_approval_delivery_contexts(
+        conn,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        task_id=task_id,
+        reply_to_message_id=reply_to_message_id,
+    )
+    return contexts[0] if contexts else None
+
+
+def approval_reply_sender_matches_subscriber(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+) -> bool:
+    """Prove that a reply sender owns the subscription for this route.
+
+    Chat/thread identity alone is insufficient in group chats: another member
+    can see the packet and type the same letter. Legacy subscriptions without a
+    stable participant id fail closed instead of granting chat-wide authority.
+    """
+    row = conn.execute(
+        "SELECT user_id, user_id_alt FROM kanban_notify_subs "
+        "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+        (task_id, platform.lower(), str(chat_id), thread_id or ""),
+    ).fetchone()
+    if row is None:
+        return False
+    expected = {
+        str(value)
+        for value in (row["user_id"], row["user_id_alt"])
+        if value is not None and str(value)
+    }
+    actual = {
+        str(value)
+        for value in (user_id, user_id_alt)
+        if value is not None and str(value)
+    }
+    return bool(expected and actual and expected.intersection(actual))
+
+
+def _append_approval_decision_audit(
+    conn: sqlite3.Connection,
+    *,
+    packet_id: Optional[str],
+    task_id: str,
+    choice: str,
+    actor: str,
+    platform: str,
+    chat_id: str,
+    freshness_token: str,
+    accepted: bool,
+    reason: str,
+) -> None:
+    from agent.monitoring.redaction import redact_for_export
+
+    safe_actor = (redact_for_export(actor) or "unknown")[:160]
+    token_digest = hashlib.sha256(str(freshness_token).encode("utf-8")).hexdigest()[:24]
+    chat_digest = hashlib.sha256(str(chat_id).encode("utf-8")).hexdigest()[:24]
+    conn.execute(
+        "INSERT INTO approval_decision_audit "
+        "(packet_id, task_id, choice, actor, platform, chat_id, freshness_token, "
+        "accepted, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            packet_id,
+            task_id,
+            str(choice)[:20],
+            safe_actor,
+            platform.lower()[:40],
+            f"sha256:{chat_digest}",
+            token_digest,
+            1 if accepted else 0,
+            reason[:160],
+            int(time.time()),
+        ),
+    )
+
+
+def record_approval_decision_rejection(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    choice: Any,
+    actor: str,
+    platform: str,
+    chat_id: str,
+    reason: str,
+    packet_id: Optional[str] = None,
+) -> bool:
+    """Audit a route/syntax rejection without changing task or packet state."""
+    with write_txn(conn):
+        if packet_id is not None:
+            row = conn.execute(
+                "SELECT packet_id, freshness_token FROM approval_packets "
+                "WHERE task_id = ? AND packet_id = ?",
+                (task_id, packet_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT packet_id, freshness_token FROM approval_packets "
+                "WHERE task_id = ? AND status = 'open' "
+                "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return False
+        _append_approval_decision_audit(
+            conn,
+            packet_id=row["packet_id"],
+            task_id=task_id,
+            choice=str(choice),
+            actor=actor,
+            platform=platform,
+            chat_id=chat_id,
+            freshness_token=str(row["freshness_token"]),
+            accepted=False,
+            reason=reason,
+        )
+    return True
+
+
+def apply_approval_decision(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    choice: Any,
+    freshness_token: Any,
+    actor: str,
+    platform: str,
+    chat_id: str,
+    packet_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Apply one explicit choice iff it targets the current open packet.
+
+    The low-level token path remains for defense-in-depth callers.  Supplying
+    ``packet_id`` selects the delivered-packet path: the private authorizer is
+    read only inside this transaction and never enters the gateway packet.
+    Rejections write only the decision-attempt audit row. Retrying the exact
+    choice for an already-decided exact packet is an idempotent no-op.
+    """
+    from hermes_cli.approval_packets import parse_approval_packet
+
+    normalized = choice.strip().upper() if isinstance(choice, str) else ""
+    supplied_token = freshness_token if isinstance(freshness_token, str) else ""
+    requested_packet_id = packet_id
+    with write_txn(conn):
+        target_reason = ""
+        duplicate_decision = False
+        if packet_id is None:
+            row = conn.execute(
+                "SELECT * FROM approval_packets WHERE task_id = ? AND status = 'open' "
+                "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row is not None and not secrets.compare_digest(
+                str(row["freshness_token"]), supplied_token
+            ):
+                target_reason = "stale approval token"
+        else:
+            row = conn.execute(
+                "SELECT * FROM approval_packets WHERE packet_id = ? AND task_id = ?",
+                (requested_packet_id, task_id),
+            ).fetchone()
+            if row is None:
+                target_reason = "approval packet not found"
+            else:
+                supplied_token = str(row["freshness_token"])
+                if (
+                    row["status"] == "decided"
+                    and normalized in ("A", "B", "C", "D")
+                    and row["decision_choice"] == normalized
+                ):
+                    newest = conn.execute(
+                        "SELECT packet_id FROM approval_packets "
+                        "WHERE task_id = ? "
+                        "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
+                    if newest is not None and newest["packet_id"] == requested_packet_id:
+                        duplicate_decision = True
+                    else:
+                        target_reason = "approval packet superseded"
+                elif row["status"] == "superseded":
+                    target_reason = "approval packet superseded"
+                elif row["status"] != "open":
+                    target_reason = f"approval packet is {row['status']}"
+                else:
+                    current = conn.execute(
+                        "SELECT packet_id FROM approval_packets "
+                        "WHERE task_id = ? AND status = 'open' "
+                        "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
+                    if current is None:
+                        target_reason = "no active approval"
+                    elif current["packet_id"] != requested_packet_id:
+                        target_reason = "approval packet superseded"
+        packet_id = row["packet_id"] if row is not None else None
+
+        reason = ""
+        packet: Optional[dict[str, Any]] = None
+        if normalized not in ("A", "B", "C", "D"):
+            reason = "invalid choice"
+        elif target_reason:
+            reason = target_reason
+        elif row is None:
+            reason = "no active approval"
+        else:
+            try:
+                packet = parse_approval_packet(row["packet_json"])
+            except ValueError:
+                reason = "malformed active packet"
+            if packet is not None and normalized not in {
+                item["id"] for item in packet["choices"]
+            }:
+                reason = "choice not offered"
+
+        if not reason and duplicate_decision:
+            # Exact packet + exact choice retries are an idempotent
+            # acknowledgement of the already-committed transaction. Strict
+            # packet parsing above is part of proving that identity. Do not
+            # append a rejection audit: the original accepted audit remains
+            # the one decision record.
+            return {
+                "accepted": True,
+                "choice": normalized,
+                "packet_id": requested_packet_id,
+                "reason": "duplicate decision; no mutation",
+                "task_mutated": False,
+                "duplicate": True,
+            }
+
+        task = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not reason and (task is None or task["status"] not in ("blocked", "triage")):
+            reason = "approval task is no longer blocked"
+
+        if reason:
+            _append_approval_decision_audit(
+                conn,
+                packet_id=packet_id,
+                task_id=task_id,
+                choice=normalized or str(choice),
+                actor=actor,
+                platform=platform,
+                chat_id=chat_id,
+                freshness_token=supplied_token,
+                accepted=False,
+                reason=reason,
+            )
+            return {
+                "accepted": False,
+                "choice": normalized or str(choice),
+                "packet_id": packet_id,
+                "reason": reason,
+                "task_mutated": False,
+            }
+
+        selected = next(item for item in packet["choices"] if item["id"] == normalized)
+        now = int(time.time())
+        safe_actor = actor[:160] if isinstance(actor, str) else "unknown"
+        updated = conn.execute(
+            "UPDATE approval_packets SET status = 'decided', decision_choice = ?, "
+            "decision_actor = ?, decision_received_at = ? "
+            "WHERE packet_id = ? AND status = 'open' AND freshness_token = ?",
+            (normalized, safe_actor, now, packet_id, supplied_token),
+        )
+        if updated.rowcount != 1:
+            _append_approval_decision_audit(
+                conn,
+                packet_id=packet_id,
+                task_id=task_id,
+                choice=normalized,
+                actor=actor,
+                platform=platform,
+                chat_id=chat_id,
+                freshness_token=supplied_token,
+                accepted=False,
+                reason="stale approval token",
+            )
+            return {
+                "accepted": False,
+                "choice": normalized,
+                "packet_id": packet_id,
+                "reason": "stale approval token",
+                "task_mutated": False,
+            }
+
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                safe_actor,
+                f"Decision {normalized}: {selected['label']}",
+                now,
+            ),
+        )
+        action = selected.get("action")
+        if action is None:
+            # Approval Packet v1 originally inferred resume-vs-pause. Preserve
+            # those packets, including the internal conservative fallback's
+            # ``resume: false`` marker, while explicit packets use ``action``.
+            action = (
+                "keep_blocked"
+                if selected.get("resume") is False
+                or selected["label"].lower().startswith("keep the task blocked")
+                else "resume"
+            )
+        decision_assignee = (
+            _canonical_assignee(selected.get("assignee"))
+            if action == "resume" and selected.get("assignee") is not None
+            else None
+        )
+        if action == "resume":
+            new_status = _landing_status_after_parents(conn, task_id)
+            sets = [
+                "status = ?",
+                "current_run_id = NULL",
+                "claim_lock = NULL",
+                "claim_expires = NULL",
+                "worker_pid = NULL",
+                "consecutive_failures = 0",
+                "last_failure_error = NULL",
+            ]
+            params: list[Any] = [new_status]
+            if decision_assignee is not None:
+                sets.append("assignee = ?")
+                params.append(decision_assignee)
+            params.append(task_id)
+            conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} "
+                "WHERE id = ? AND status IN ('blocked', 'triage')",
+                tuple(params),
+            )
+        elif action == "decompose":
+            conn.execute(
+                "UPDATE tasks SET status = 'triage', current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status IN ('blocked', 'triage')",
+                (task_id,),
+            )
+        decision_payload = {
+            "packet_id": packet_id,
+            "choice": normalized,
+            "label": selected["label"],
+            "action": action,
+            "resumed": action == "resume",
+        }
+        if decision_assignee is not None:
+            decision_payload["assignee"] = decision_assignee
+        _append_event(
+            conn,
+            task_id,
+            "approval_decided",
+            decision_payload,
+        )
+        if action == "decompose":
+            _append_event(
+                conn,
+                task_id,
+                "decomposition_requested",
+                {
+                    "packet_id": packet_id,
+                    "generation": packet["freshness"]["generation"],
+                    "choice": normalized,
+                },
+            )
+        _append_approval_decision_audit(
+            conn,
+            packet_id=packet_id,
+            task_id=task_id,
+            choice=normalized,
+            actor=actor,
+            platform=platform,
+            chat_id=chat_id,
+            freshness_token=supplied_token,
+            accepted=True,
+            reason="decision applied",
+        )
+        return {
+            "accepted": True,
+            "choice": normalized,
+            "packet_id": packet_id,
+            "reason": "decision applied",
+            "task_mutated": True,
+        }
+
+
+def apply_approval_decision_for_packet(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    packet_id: str,
+    choice: Any,
+    actor: str,
+    platform: str,
+    chat_id: str,
+) -> dict[str, Any]:
+    """Apply a delivered packet choice without exposing its authorizer.
+
+    Selection, current/open verification, nonce lookup, mutation, and audit
+    all occur inside one transaction. A same-choice retry for the exact decided
+    packet is idempotent; a superseded packet is audited against that exact
+    packet and can never retarget the current generation.
+    """
+    return apply_approval_decision(
+        conn,
+        task_id=task_id,
+        choice=choice,
+        freshness_token=None,
+        actor=actor,
+        platform=platform,
+        chat_id=chat_id,
+        packet_id=packet_id,
+    )
+
+
+def list_approval_decision_audit(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    packet_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM approval_decision_audit"
+    clauses: list[str] = []
+    params: list[Any] = []
+    if task_id is not None:
+        clauses.append("task_id = ?")
+        params.append(task_id)
+    if packet_id is not None:
+        clauses.append("packet_id = ?")
+        params.append(packet_id)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY id ASC"
+    rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+    for row in rows:
+        row["accepted"] = bool(row["accepted"])
+    return rows
 
 
 def _end_run(
@@ -6250,6 +7191,8 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    approval: Optional[Mapping[str, Any]] = None,
+    board_slug: Optional[str] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6282,6 +7225,12 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # Validate worker input before entering the task transition.  Packet
+    # construction validates again after resolving evidence metadata, but this
+    # early pass guarantees malformed hints cannot mutate the task first.
+    from hermes_cli.approval_packets import validate_approval_input
+
+    approval = validate_approval_input(approval)
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6391,7 +7340,7 @@ def block_task(
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
-            _append_event(
+            event_id = _append_event(
                 conn, task_id, "block_loop_detected",
                 {
                     "reason": reason,
@@ -6401,6 +7350,16 @@ def block_task(
                     "source_status": source_status,
                 },
                 run_id=run_id,
+            )
+            _create_approval_packet_for_event(
+                conn,
+                task_id=task_id,
+                event_id=event_id,
+                event_kind="block_loop_detected",
+                reason=reason or "A repeated blocker requires a human decision.",
+                block_kind=kind,
+                board_slug=board_slug,
+                approval=approval,
             )
         else:
             if expected_run_id is None:
@@ -6449,7 +7408,7 @@ def block_task(
                     outcome="blocked",
                     summary=reason,
                 )
-            _append_event(
+            event_id = _append_event(
                 conn, task_id, "blocked",
                 {
                     "reason": reason,
@@ -6459,6 +7418,17 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            if kind in ("needs_input", "capability"):
+                _create_approval_packet_for_event(
+                    conn,
+                    task_id=task_id,
+                    event_id=event_id,
+                    event_kind="blocked",
+                    reason=reason or "A human decision is required.",
+                    block_kind=kind,
+                    board_slug=board_slug,
+                    approval=approval,
+                )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -6937,6 +7907,14 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        # Leaving the human-decision state invalidates its reply token.  If a
+        # later non-actionable failure blocks the same task, an old delivered
+        # choice must not be able to unlock that unrelated blocker.
+        conn.execute(
+            "UPDATE approval_packets SET status = 'superseded' "
+            "WHERE task_id = ? AND status = 'open'",
+            (task_id,),
+        )
         _append_event(
             conn, task_id, "unblocked",
             (
@@ -7215,6 +8193,11 @@ def specify_triage_task(
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        if (
+            author == "auto-decomposer"
+            and not has_current_decomposition_intent(conn, task_id)
+        ):
+            return False
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -7369,6 +8352,11 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        if (
+            author == "auto-decomposer"
+            and not has_current_decomposition_intent(conn, task_id)
+        ):
+            return None
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
@@ -7510,6 +8498,58 @@ def decompose_triage_task(
     return child_ids
 
 
+def _delete_approval_state(
+    conn: sqlite3.Connection, task_id: str
+) -> list[tuple[str, str]]:
+    """Delete approval rows in dependency order and return card paths."""
+    cards = [
+        (str(row["packet_id"]), str(row["card_path"]))
+        for row in conn.execute(
+            "SELECT packet_id, card_path FROM approval_packets "
+            "WHERE task_id = ? AND card_path IS NOT NULL",
+            (task_id,),
+        ).fetchall()
+    ]
+    conn.execute(
+        "DELETE FROM approval_decision_audit WHERE task_id = ?",
+        (task_id,),
+    )
+    conn.execute(
+        "DELETE FROM approval_deliveries WHERE packet_id IN "
+        "(SELECT packet_id FROM approval_packets WHERE task_id = ?)",
+        (task_id,),
+    )
+    conn.execute("DELETE FROM approval_packets WHERE task_id = ?", (task_id,))
+    return cards
+
+
+def _remove_approval_cards(
+    conn: sqlite3.Connection, cards: list[tuple[str, str]]
+) -> None:
+    """Remove only generated cards proven to remain under this board root."""
+    if not cards:
+        return
+    db_row = conn.execute("PRAGMA database_list").fetchone()
+    if not db_row or not db_row["file"]:
+        return
+    root = (Path(db_row["file"]).resolve().parent / "approval_cards").resolve()
+    for packet_id, raw_path in cards:
+        try:
+            card = Path(raw_path).resolve(strict=True)
+        except (OSError, TypeError, ValueError):
+            continue
+        if card.parent != root or card.name != f"{packet_id}.png":
+            _log.warning(
+                "refusing to delete approval card outside board-owned directory: %s",
+                raw_path,
+            )
+            continue
+        try:
+            card.unlink()
+        except OSError as exc:
+            _log.warning("could not delete approval card %s: %s", card, exc)
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
@@ -7546,6 +8586,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     tasks must be explicitly archived first so accidental data loss requires a
     second deliberate action.
     """
+    cards: list[tuple[str, str]] = []
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -7561,8 +8602,12 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        cards = _delete_approval_state(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+        deleted = cur.rowcount == 1
+    if deleted:
+        _remove_approval_cards(conn, cards)
+    return deleted
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -7575,6 +8620,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
+    cards: list[tuple[str, str]] = []
     with write_txn(conn):
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
@@ -7584,6 +8630,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        cards = _delete_approval_state(conn, task_id)
+    _remove_approval_cards(conn, cards)
     recompute_ready(conn)
     return True
 

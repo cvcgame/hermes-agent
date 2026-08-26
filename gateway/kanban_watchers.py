@@ -465,6 +465,23 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    approval_packets: dict[int, dict] = {}
+                                    try:
+                                        approval_packets = {
+                                            int(packet["provenance"]["event_id"]): packet
+                                            for packet in _kb.list_approval_packets(
+                                                conn, task_id=sub["task_id"]
+                                            )
+                                            if packet["provenance"]["status"] == "open"
+                                        }
+                                    except Exception as packet_exc:
+                                        # Fail closed: malformed durable packet
+                                        # data can never fall back to a generic
+                                        # human-block notification.
+                                        logger.warning(
+                                            "kanban notifier: approval packet read failed for %s: %s",
+                                            sub["task_id"], packet_exc,
+                                        )
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -476,6 +493,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "approval_packets": approval_packets,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -548,6 +566,23 @@ class GatewayKanbanWatchersMixin:
                     wake_handoff = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        approval_packet = None
+                        actionable_block = (
+                            kind == "block_loop_detected"
+                            or (
+                                kind == "blocked"
+                                and isinstance(ev.payload, dict)
+                                and ev.payload.get("kind") in ("needs_input", "capability")
+                            )
+                        )
+                        if actionable_block:
+                            approval_packet = d.get("approval_packets", {}).get(int(ev.id))
+                            if approval_packet is None:
+                                logger.warning(
+                                    "kanban notifier: suppressing actionable %s event %s for %s because its Approval Packet v1 is missing or malformed",
+                                    kind, ev.id, sub["task_id"],
+                                )
+                                continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -576,6 +611,13 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
+                            )
+                        elif approval_packet is not None:
+                            from hermes_cli.approval_packets import format_approval_packet_text
+
+                            msg = format_approval_packet_text(
+                                approval_packet,
+                                allow_short_reply=platform_str == "telegram",
                             )
                         elif kind == "blocked":
                             reason = ""
@@ -689,6 +731,19 @@ class GatewayKanbanWatchersMixin:
                             # is resolved (reset or bumped) by the wake
                             # outcome there, not by skipping the send here.
                             continue
+                        if approval_packet is not None:
+                            claimed = await _to_thread_process_service(
+                                self._kanban_begin_approval_delivery,
+                                approval_packet["packet_id"],
+                                sub,
+                                board_slug,
+                            )
+                            if not claimed:
+                                logger.debug(
+                                    "kanban notifier: approval packet %s already delivered/in flight for %s/%s",
+                                    approval_packet["packet_id"], platform_str, sub["chat_id"],
+                                )
+                                continue
                         try:
                             _send_res = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
@@ -704,6 +759,23 @@ class GatewayKanbanWatchersMixin:
                                 raise RuntimeError(
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                                )
+                            if approval_packet is not None:
+                                media_status, media_message_id = await self._deliver_approval_packet_media(
+                                    adapter=adapter,
+                                    chat_id=sub["chat_id"],
+                                    metadata=metadata,
+                                    packet=approval_packet,
+                                    board=board_slug,
+                                )
+                                await _to_thread_process_service(
+                                    self._kanban_finish_approval_delivery,
+                                    approval_packet["packet_id"],
+                                    sub,
+                                    board_slug,
+                                    getattr(_send_res, "message_id", None),
+                                    media_status,
+                                    media_message_id,
                                 )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
@@ -735,6 +807,13 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
+                            if approval_packet is not None:
+                                await _to_thread_process_service(
+                                    self._kanban_fail_approval_delivery,
+                                    approval_packet["packet_id"],
+                                    sub,
+                                    board_slug,
+                                )
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
                             logger.warning(
@@ -1054,6 +1133,129 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    def _kanban_begin_approval_delivery(
+        self,
+        packet_id: str,
+        sub: dict,
+        board: Optional[str] = None,
+    ) -> bool:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.begin_approval_delivery(
+                conn,
+                packet_id=packet_id,
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    def _kanban_finish_approval_delivery(
+        self,
+        packet_id: str,
+        sub: dict,
+        board: Optional[str],
+        text_message_id: Optional[str],
+        media_status: str,
+        media_message_id: Optional[str],
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            _kb.finish_approval_delivery(
+                conn,
+                packet_id=packet_id,
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                text_message_id=text_message_id,
+                media_status=media_status,
+                media_message_id=media_message_id,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_fail_approval_delivery(
+        self,
+        packet_id: str,
+        sub: dict,
+        board: Optional[str],
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            _kb.fail_approval_delivery(
+                conn,
+                packet_id=packet_id,
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    async def _deliver_approval_packet_media(
+        self,
+        *,
+        adapter,
+        chat_id: str,
+        metadata: dict,
+        packet: dict,
+        board: Optional[str],
+    ) -> tuple[str, Optional[str]]:
+        """Best-effort native PNG delivery; text has already succeeded."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        method = getattr(type(adapter), "send_image_file", None)
+        if method is None or method is BasePlatformAdapter.send_image_file:
+            return "not_supported", None
+        card_path = (packet.get("provenance") or {}).get("card_path")
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            card = Path(card_path).resolve(strict=True) if card_path else None
+            card_root = (
+                _kb.kanban_db_path(board).resolve().parent / "approval_cards"
+            ).resolve(strict=True)
+        except (OSError, TypeError, ValueError):
+            return "failed", None
+        if (
+            card is None
+            or not card.is_file()
+            or card.parent != card_root
+            or card.name != f"{packet['packet_id']}.png"
+        ):
+            logger.warning(
+                "kanban notifier: refusing approval card outside the board-owned card directory for %s",
+                packet.get("task_id"),
+            )
+            return "failed", None
+        try:
+            result = await adapter.send_image_file(
+                chat_id=chat_id,
+                image_path=str(card),
+                caption=f"Approval Packet · {packet['task_id']}",
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: approval card media failed for %s: %s",
+                packet["task_id"], exc,
+            )
+            return "failed", None
+        if getattr(result, "success", True) is False:
+            logger.warning(
+                "kanban notifier: approval card media failed for %s: %s",
+                packet["task_id"], getattr(result, "error", None) or "unknown error",
+            )
+            return "failed", None
+        return "delivered", getattr(result, "message_id", None)
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
         from hermes_cli import kanban_db as _kb
@@ -1600,8 +1802,12 @@ class GatewayKanbanWatchersMixin:
                             pass
             return False
 
-        # Auto-decompose: turn fresh triage tasks into ready workgraphs
-        # before the dispatcher fans out workers. Gated by
+        # Auto-decompose: turn triage tasks with an explicit, current
+        # generation-bound decomposition intent into ready workgraphs before
+        # the dispatcher fans out workers. Merely entering triage is never
+        # consent; ``list_triage_ids()`` fails closed on ordinary triage rows
+        # and the DB mutation boundary revalidates the same intent after the
+        # auxiliary call. Gated by
         # ``kanban.auto_decompose`` (default True). Capped by
         # ``kanban.auto_decompose_per_tick`` (default 3) so a bulk-load
         # of triage tasks doesn't burst-spend the aux LLM in one tick;
@@ -1620,8 +1826,8 @@ class GatewayKanbanWatchersMixin:
             return _resolve_auto_decompose_settings(_load_config)
 
         def _auto_decompose_tick(auto_decompose_per_tick: int) -> int:
-            """Run the auto-decomposer for up to N triage tasks across all
-            boards. Returns the number of triage tasks that were
+            """Run the auto-decomposer for up to N explicitly authorized
+            triage tasks across all boards. Returns the number of tasks that were
             successfully decomposed or specified this tick.
             """
             try:

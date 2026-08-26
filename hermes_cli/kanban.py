@@ -3151,7 +3151,10 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
         return 2
 
     if all_flag:
-        ids = decomp.list_triage_ids(tenant=tenant)
+        ids = decomp.list_triage_ids(
+            tenant=tenant,
+            require_decomposition_intent=False,
+        )
         if not ids:
             msg = (
                 "No triage tasks"

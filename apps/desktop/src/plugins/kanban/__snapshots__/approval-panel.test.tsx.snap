@@ -1,0 +1,150 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`Approval required panel > renders the structured API packet as an actionable, sanitized panel 1`] = `
+<section
+  aria-label="Approval required"
+  class="border-l-2 border-(--ui-accent) pl-3"
+  role="region"
+>
+  <div
+    class="mb-2 flex items-center gap-2"
+  >
+    <i
+      aria-hidden="true"
+      class="codicon codicon-warning text-(--ui-accent)"
+      style="font-size: 0.9rem;"
+    />
+    <h3
+      class="text-[0.78rem] font-semibold text-(--ui-accent)"
+    >
+      Approval required
+    </h3>
+    <span
+      class="inline-flex w-fit shrink-0 items-center gap-1 rounded-[3px] font-medium whitespace-nowrap [&_svg]:pointer-events-none border border-(--ui-stroke-secondary) text-muted-foreground px-1.5 py-0.5 text-[0.65rem] [&_svg]:size-3 ml-auto"
+      data-slot="badge"
+    >
+      needs_input
+    </span>
+  </div>
+  <p
+    class="text-[0.82rem] font-medium text-foreground"
+  >
+    Which rollout should we use?
+  </p>
+  <dl
+    class="mt-2 grid grid-cols-[5rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-[0.69rem]"
+  >
+    <dt
+      class="text-(--ui-text-quaternary)"
+    >
+      Why blocked
+    </dt>
+    <dd
+      class="whitespace-pre-wrap text-(--ui-text-secondary)"
+    >
+      A human must select the rollout risk.
+    </dd>
+    <dt
+      class="text-(--ui-text-quaternary)"
+    >
+      Safe state
+    </dt>
+    <dd
+      class="whitespace-pre-wrap text-(--ui-text-secondary)"
+    >
+      Build and focused tests are complete; task remains blocked.
+    </dd>
+    <dt
+      class="text-(--ui-text-quaternary)"
+    >
+      Impact
+    </dt>
+    <dd
+      class="text-(--ui-text-secondary)"
+    >
+      1 dependent task waiting
+       · t_child
+    </dd>
+  </dl>
+  <ol
+    aria-label="Approval choices"
+    class="mt-3 flex flex-col gap-1.5"
+  >
+    <li
+      class="border-t border-(--ui-stroke-tertiary) py-1.5 first:border-t-0"
+    >
+      <div
+        class="flex items-center gap-1.5 text-[0.72rem]"
+      >
+        <span
+          class="font-mono font-semibold text-(--ui-accent)"
+        >
+          A
+        </span>
+        <span
+          class="font-medium text-(--ui-text-secondary)"
+        >
+          Staged rollout
+        </span>
+        <span
+          class="inline-flex w-fit shrink-0 items-center gap-1 rounded-[3px] font-medium whitespace-nowrap [&_svg]:pointer-events-none bg-amber-500/10 text-amber-600 dark:text-amber-300 px-1.5 py-0.5 text-[0.65rem] [&_svg]:size-3"
+          data-slot="badge"
+        >
+          Recommended
+        </span>
+      </div>
+      <p
+        class="mt-0.5 text-[0.65rem] text-(--ui-text-quaternary)"
+      >
+        Slower, lower risk
+      </p>
+    </li>
+    <li
+      class="border-t border-(--ui-stroke-tertiary) py-1.5 first:border-t-0"
+    >
+      <div
+        class="flex items-center gap-1.5 text-[0.72rem]"
+      >
+        <span
+          class="font-mono font-semibold text-(--ui-accent)"
+        >
+          B
+        </span>
+        <span
+          class="font-medium text-(--ui-text-secondary)"
+        >
+          Immediate rollout
+        </span>
+      </div>
+      <p
+        class="mt-0.5 text-[0.65rem] text-(--ui-text-quaternary)"
+      >
+        Faster, higher risk
+      </p>
+    </li>
+  </ol>
+  <div
+    class="mt-3 text-[0.65rem] text-(--ui-text-quaternary)"
+  >
+    <p>
+      Evidence: attachment:7 (rollout-report.txt)
+    </p>
+    <p>
+      Attachments: rollout-report.txt · text/plain · 240 B
+    </p>
+    <p
+      class="mt-1 font-mono text-(--ui-text-tertiary)"
+    >
+      /kanban decide t_abc12345 &lt;choice&gt;
+    </p>
+    <p
+      class="font-mono"
+    >
+      Freshness: 1777000000 · generation 1
+    </p>
+    <p>
+      Sanitized: bounded · pii redacted · secrets redacted
+    </p>
+  </div>
+</section>
+`;

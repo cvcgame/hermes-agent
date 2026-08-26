@@ -7,12 +7,14 @@ and the assignee-fallback logic.
 
 from __future__ import annotations
 
+import argparse
 import json as jsonlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_decompose as decomp
 
@@ -73,6 +75,51 @@ def _patch_list_profiles(names: list[str]):
         patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
         patch("hermes_cli.profiles.get_active_profile_name", return_value=names[0] if names else "default"),
     ]
+
+
+def _create_current_decompose_intent(conn) -> str:
+    task_id = kb.create_task(conn, title="explicit fan-out", assignee="worker")
+    assert kb.block_task(
+        conn,
+        task_id,
+        kind="needs_input",
+        reason="Choose whether to split this task.",
+    )
+    assert kb.unblock_task(conn, task_id)
+    assert kb.block_task(
+        conn,
+        task_id,
+        kind="needs_input",
+        reason="Choose whether to split this task again.",
+    )
+    packet = kb.get_active_approval_packet(conn, task_id)
+    assert packet is not None
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE approval_packets SET status = 'decided', "
+            "decision_choice = 'A', decision_actor = 'operator' "
+            "WHERE packet_id = ?",
+            (packet["packet_id"],),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "decomposition_requested",
+            {
+                "packet_id": packet["packet_id"],
+                "generation": packet["freshness"]["generation"],
+                "choice": "A",
+            },
+        )
+    return task_id
+
+
+def _run_cli(*argv: str) -> int:
+    root = argparse.ArgumentParser()
+    subparsers = root.add_subparsers(dest="command")
+    kanban_cli.build_parser(subparsers)
+    args = root.parse_args(["kanban", *argv])
+    return kanban_cli.kanban_command(args)
 
 
 def test_decompose_with_fanout_creates_children(kanban_home):
@@ -161,3 +208,32 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_auto_facing_triage_list_requires_current_explicit_decompose_intent(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        ordinary = kb.create_task(conn, title="ordinary triage", triage=True)
+        explicit = _create_current_decompose_intent(conn)
+
+    listed = decomp.list_triage_ids()
+
+    assert explicit in listed
+    assert ordinary not in listed
+    assert set(listed) == {explicit}
+
+
+def test_explicit_cli_decompose_all_opts_in_to_all_triage_rows(
+    kanban_home, monkeypatch
+):
+    calls = []
+
+    def _list_triage_ids(
+        *, tenant=None, require_decomposition_intent: bool = True
+    ):
+        calls.append((tenant, require_decomposition_intent))
+        return []
+
+    monkeypatch.setattr(decomp, "list_triage_ids", _list_triage_ids)
+
+    assert _run_cli("decompose", "--all") == 0
+    assert calls == [(None, False)]

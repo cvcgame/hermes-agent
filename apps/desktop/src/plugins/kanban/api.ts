@@ -165,6 +165,12 @@ export const fetchBoard = (archived: boolean) =>
 
 export const fetchTask = (id: string) => call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
 
+export const markApprovalRead = (id: string, packetId: string) =>
+  call<{ packet_id: string; read: boolean }>(withBoard(`/tasks/${id}/approval/read`), {
+    method: 'POST',
+    body: { packet_id: packetId, reader_id: 'desktop-drawer' }
+  })
+
 /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
 export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: '16384' }))
 

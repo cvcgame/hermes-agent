@@ -503,6 +503,21 @@ class GatewaySlashCommandsMixin:
 
         is_create = action == "create"
 
+        # Approval decisions do not enter the agent or the general kanban CLI.
+        # They are resolved against the packet actually delivered to this
+        # platform/chat/thread and applied only after freshness validation.
+        from gateway.kanban_approvals import handle_approval_reply
+
+        decision_output = await asyncio.to_thread(
+            handle_approval_reply,
+            event.text,
+            source=event.source,
+            requested_board=requested_board,
+            reply_to_message_id=getattr(event, "reply_to_message_id", None),
+        )
+        if decision_output is not None:
+            return decision_output
+
         try:
             output = await asyncio.to_thread(run_slash, text)
         except Exception as exc:  # pragma: no cover - defensive
