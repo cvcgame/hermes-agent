@@ -127,6 +127,21 @@ type KanbanMessages = {
   readyUnassignedBody: string
   diagnosticsN: (n: number) => string
   commandCopied: string
+  approval: {
+    required: string
+    whyBlocked: string
+    safeState: string
+    impactLabel: string
+    impact: (n: number) => string
+    choices: string
+    recommended: string
+    evidence: string
+    attachments: string
+    freshness: string
+    generation: string
+    sanitized: string
+    file: string
+  }
   description: string
   editDescription: string
   cancelEdit: string
@@ -328,6 +343,21 @@ export const en: KanbanMessages = {
     'The dispatcher only claims Ready cards that have an assignee. Pick a profile in the Assignee field above (or set a default assignee in the orchestration settings) and it runs within a minute.',
   diagnosticsN: n => `Diagnostics · ${n}`,
   commandCopied: 'Command copied',
+  approval: {
+    required: 'Approval required',
+    whyBlocked: 'Why blocked',
+    safeState: 'Safe state',
+    impactLabel: 'Impact',
+    impact: n => `${n} dependent ${n === 1 ? 'task' : 'tasks'} waiting`,
+    choices: 'Approval choices',
+    recommended: 'Recommended',
+    evidence: 'Evidence',
+    attachments: 'Attachments',
+    freshness: 'Freshness',
+    generation: 'generation',
+    sanitized: 'Sanitized',
+    file: 'file'
+  },
   description: 'Description',
   editDescription: 'Edit description',
   cancelEdit: 'Cancel edit',
@@ -529,6 +559,21 @@ const ja: KanbanMessages = {
     'ディスパッチャは担当のある Ready カードのみ取得します。上の担当フィールドでプロフィールを選ぶ（またはオーケストレーション設定でデフォルトの担当を設定する）と、1分以内に実行されます。',
   diagnosticsN: n => `診断・${n}`,
   commandCopied: 'コマンドをコピーしました',
+  approval: {
+    required: '承認が必要です',
+    whyBlocked: 'ブロック理由',
+    safeState: '安全な状態',
+    impactLabel: '影響',
+    impact: n => `待機中の依存タスク ${n} 件`,
+    choices: '承認の選択肢',
+    recommended: '推奨',
+    evidence: '根拠',
+    attachments: '添付',
+    freshness: '鮮度',
+    generation: '世代',
+    sanitized: 'サニタイズ済み',
+    file: 'ファイル'
+  },
   description: '説明',
   editDescription: '説明を編集',
   cancelEdit: '編集をキャンセル',
@@ -729,6 +774,21 @@ const zh: KanbanMessages = {
     '调度器只领取有负责人的就绪卡片。在上面的负责人字段选择一个配置档（或在编排设置中设置默认负责人），它会在一分钟内运行。',
   diagnosticsN: n => `诊断・${n}`,
   commandCopied: '命令已复制',
+  approval: {
+    required: '需要批准',
+    whyBlocked: '阻塞原因',
+    safeState: '安全状态',
+    impactLabel: '影响',
+    impact: n => `${n} 个依赖任务正在等待`,
+    choices: '批准选项',
+    recommended: '推荐',
+    evidence: '证据',
+    attachments: '附件',
+    freshness: '时效',
+    generation: '代次',
+    sanitized: '已脱敏',
+    file: '文件'
+  },
   description: '描述',
   editDescription: '编辑描述',
   cancelEdit: '取消编辑',
@@ -927,6 +987,21 @@ const zhHant: KanbanMessages = {
     '排程器只領取有負責人的就緒卡片。在上方的負責人欄位選擇一個設定檔（或在編排設定中設定預設負責人），它會在一分鐘內執行。',
   diagnosticsN: n => `診斷・${n}`,
   commandCopied: '指令已複製',
+  approval: {
+    required: '需要核准',
+    whyBlocked: '阻塞原因',
+    safeState: '安全狀態',
+    impactLabel: '影響',
+    impact: n => `${n} 個相依任務正在等待`,
+    choices: '核准選項',
+    recommended: '建議',
+    evidence: '證據',
+    attachments: '附件',
+    freshness: '時效',
+    generation: '世代',
+    sanitized: '已去識別化',
+    file: '檔案'
+  },
   description: '描述',
   editDescription: '編輯描述',
   cancelEdit: '取消編輯',

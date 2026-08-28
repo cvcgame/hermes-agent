@@ -832,6 +832,7 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    approval = args.get("approval")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -870,6 +871,8 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                approval=approval,
+                board_slug=board,
             )
             if not ok:
                 return tool_error(
@@ -1893,6 +1896,77 @@ KANBAN_BLOCK_SCHEMA = {
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
                 ),
+            },
+            "approval": {
+                "type": "object",
+                "additionalProperties": False,
+                "description": (
+                    "Optional structured Approval Packet hints for needs_input "
+                    "or capability blocks. Omit choices to use a conservative "
+                    "fallback derived from the reason and task metadata."
+                ),
+                "properties": {
+                    "decision_question": {"type": "string"},
+                    "completed_state": {
+                        "type": "string",
+                        "description": "What is complete and what remains safely paused.",
+                    },
+                    "evidence_refs": {
+                        "type": "array",
+                        "maxItems": 12,
+                        "items": {
+                            "oneOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "kind": {"type": "string"},
+                                        "ref": {"type": "string"},
+                                        "label": {"type": "string"},
+                                    },
+                                    "required": ["ref"],
+                                },
+                            ]
+                        },
+                    },
+                    "choices": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "id": {"type": "string", "enum": ["A", "B", "C", "D"]},
+                                "label": {"type": "string"},
+                                "tradeoff": {"type": "string"},
+                                "recommended": {"type": "boolean"},
+                                "action": {
+                                    "type": "string",
+                                    "enum": [
+                                        "resume",
+                                        "keep_blocked",
+                                        "decompose",
+                                    ],
+                                    "description": (
+                                        "Optional operator action. Omit for the "
+                                        "ordinary resume/keep-blocked behavior."
+                                    ),
+                                },
+                                "assignee": {
+                                    "type": "string",
+                                    "maxLength": 64,
+                                    "description": (
+                                        "Optional profile to assign before resuming; "
+                                        "valid only when action is 'resume'."
+                                    ),
+                                },
+                            },
+                            "required": ["id", "label", "tradeoff", "recommended"],
+                        },
+                    },
+                },
             },
             "board": _board_schema_prop(),
         },

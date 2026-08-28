@@ -38,6 +38,7 @@ import {
   fetchProfiles,
   fetchTask,
   logKey,
+  markApprovalRead,
   patchTask,
   PROFILES_KEY,
   reassignTask,
@@ -45,8 +46,10 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { en } from './i18n'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
+  type ApprovalPacket,
   type Diagnostic,
   type DiagnosticAction,
   type KanbanAttachment,
@@ -72,6 +75,82 @@ import {
   useDefaultAssignee,
   useKanban
 } from './ui'
+
+interface ApprovalRequiredPanelProps {
+  packet: ApprovalPacket
+  text?: KanbanText['approval']
+}
+
+export function ApprovalRequiredPanel({ packet, text = en.approval }: ApprovalRequiredPanelProps) {
+  const waiting = packet.impact.waiting_count
+
+  return (
+    <section
+      aria-label={text.required}
+      className="border-l-2 border-(--ui-accent) pl-3"
+      role="region"
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <Codicon className="text-(--ui-accent)" name="warning" size="0.9rem" />
+        <h3 className="text-[0.78rem] font-semibold text-(--ui-accent)">{text.required}</h3>
+        <Badge className="ml-auto" variant="outline">
+          {packet.block_kind ?? packet.provenance.event_kind}
+        </Badge>
+      </div>
+
+      <p className="text-[0.82rem] font-medium text-foreground">{packet.decision_question}</p>
+      <dl className="mt-2 grid grid-cols-[5rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-[0.69rem]">
+        <dt className="text-(--ui-text-quaternary)">{text.whyBlocked}</dt>
+        <dd className="whitespace-pre-wrap text-(--ui-text-secondary)">{packet.why_blocked}</dd>
+        <dt className="text-(--ui-text-quaternary)">{text.safeState}</dt>
+        <dd className="whitespace-pre-wrap text-(--ui-text-secondary)">{packet.completed_state}</dd>
+        <dt className="text-(--ui-text-quaternary)">{text.impactLabel}</dt>
+        <dd className="text-(--ui-text-secondary)">
+          {text.impact(waiting)}
+          {packet.impact.dependents.length > 0
+            ? ` · ${packet.impact.dependents.map(item => item.task_id).join(', ')}`
+            : ''}
+        </dd>
+      </dl>
+
+      <ol aria-label={text.choices} className="mt-3 flex flex-col gap-1.5">
+        {packet.choices.map(choice => (
+          <li className="border-t border-(--ui-stroke-tertiary) py-1.5 first:border-t-0" key={choice.id}>
+            <div className="flex items-center gap-1.5 text-[0.72rem]">
+              <span className="font-mono font-semibold text-(--ui-accent)">{choice.id}</span>
+              <span className="font-medium text-(--ui-text-secondary)">{choice.label}</span>
+              {choice.recommended ? <Badge variant="warn">{text.recommended}</Badge> : null}
+            </div>
+            <p className="mt-0.5 text-[0.65rem] text-(--ui-text-quaternary)">{choice.tradeoff}</p>
+          </li>
+        ))}
+      </ol>
+
+      <div className="mt-3 text-[0.65rem] text-(--ui-text-quaternary)">
+        <p>
+          {`${text.evidence}: ${packet.evidence.map(item => `${item.ref} (${item.label})`).join(' · ')}`}
+        </p>
+        {packet.attachments.length > 0 ? (
+          <p>
+            {`${text.attachments}: ${packet.attachments
+              .map(item => `${item.filename} · ${item.content_type ?? text.file} · ${item.size ?? 0} B`)
+              .join(' · ')}`}
+          </p>
+        ) : null}
+        <p className="mt-1 font-mono text-(--ui-text-tertiary)">{packet.reply_syntax.command}</p>
+        <p className="font-mono">
+          {`${text.freshness}: ${packet.freshness.created_at} · ${text.generation} ${packet.freshness.generation}`}
+        </p>
+        <p>
+          {`${text.sanitized}: ${Object.entries(packet.redaction_attestations)
+            .filter(([, attested]) => attested)
+            .map(([name]) => name.replace(/_/g, ' '))
+            .join(' · ')}`}
+        </p>
+      </div>
+    </section>
+  )
+}
 
 /**
  * Turn a task_events row into an operator-readable line. The backend logs
@@ -561,8 +640,17 @@ export function TaskDrawer({
   })
 
   const task = detail?.task
+  const approvalPacketId = detail?.approval?.packet_id
   const running = task?.status === 'running'
   const defaultAssignee = useDefaultAssignee()
+
+  useEffect(() => {
+    if (!id || !approvalPacketId) {
+      return
+    }
+
+    void markApprovalRead(id, approvalPacketId).catch(() => undefined)
+  }, [approvalPacketId, id])
 
   const { data: log } = useQuery({
     enabled: !!id,
@@ -791,6 +879,8 @@ export function TaskDrawer({
                 <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">{k.readyUnassignedBody}</p>
               </Callout>
             )}
+
+            {detail.approval ? <ApprovalRequiredPanel packet={detail.approval} text={k.approval} /> : null}
 
             {task.diagnostics && task.diagnostics.length > 0 && (
               <Section label={k.diagnosticsN(task.diagnostics.length)}>

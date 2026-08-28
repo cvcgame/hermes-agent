@@ -18,8 +18,10 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import ImageDraw
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import approval_packets
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +220,147 @@ def test_task_detail_includes_links_and_events(client):
 
     # Events exist from creation.
     assert len(data["events"]) >= 1
+
+
+def test_task_detail_exposes_approval_panel_data_and_readback_is_not_decision(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "Approve dashboard rollout"}
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        assert kb.block_task(
+            conn,
+            task["id"],
+            reason="Choose the dashboard rollout",
+            kind="needs_input",
+        )
+        packet = kb.get_active_approval_packet(conn, task["id"])
+    finally:
+        conn.close()
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}")
+
+    assert detail.status_code == 200
+    approval = detail.json()["approval"]
+    assert approval["packet_id"] == packet["packet_id"]
+    assert approval["decision_question"]
+    assert approval["provenance"]["status"] == "open"
+    assert approval["provenance"]["decision"] is None
+    assert "card_path" not in approval["provenance"]
+    assert approval["deliveries"] == []
+
+    read = client.post(
+        f"/api/plugins/kanban/tasks/{task['id']}/approval/read",
+        json={"packet_id": packet["packet_id"], "reader_id": "desktop-drawer"},
+    )
+
+    assert read.status_code == 200
+    after = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    assert after["task"]["status"] == "blocked"
+    assert after["approval"]["provenance"]["status"] == "open"
+    assert after["approval"]["provenance"]["decision"] is None
+    assert after["approval"]["deliveries"][0]["status"] == "delivered"
+    assert after["approval"]["deliveries"][0]["read_at"] is not None
+
+
+def test_mutation_authorizer_is_private_across_all_packet_surfaces(
+    client, monkeypatch
+):
+    mutation_authorizer = "mutation-authorizer-do-not-expose"
+    monkeypatch.setattr(
+        approval_packets.secrets,
+        "token_urlsafe",
+        lambda _length: mutation_authorizer,
+    )
+
+    rendered_png_text: list[str] = []
+    original_draw_text = ImageDraw.ImageDraw.text
+
+    def recording_draw_text(draw, xy, text, *args, **kwargs):
+        rendered_png_text.append(str(text))
+        return original_draw_text(draw, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", recording_draw_text)
+
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Keep the approval authorizer private"},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        assert kb.block_task(
+            conn,
+            task["id"],
+            reason="Choose the safe rollout generation",
+            kind="needs_input",
+        )
+        packet = kb.get_active_approval_packet(conn, task["id"])
+        assert packet is not None
+        stored = conn.execute(
+            "SELECT packet_json, freshness_token FROM approval_packets "
+            "WHERE packet_id = ?",
+            (packet["packet_id"],),
+        ).fetchone()
+        assert stored is not None
+        # Mutation authorization remains available to the internal decision
+        # transaction, but is never part of the sanitized packet contract.
+        assert stored["freshness_token"] == mutation_authorizer
+        durable_packet = json.loads(stored["packet_json"])
+    finally:
+        conn.close()
+
+    gateway_text = approval_packets.format_approval_packet_text(packet)
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}")
+    assert detail.status_code == 200
+    dashboard_packet = detail.json()["approval"]
+
+    serialized_surfaces = {
+        "sanitized packet dict": json.dumps(packet, sort_keys=True),
+        "durable sanitized packet JSON": stored["packet_json"],
+        "formatted gateway text": gateway_text,
+        "PNG draw.text surface": "\n".join(rendered_png_text),
+        "dashboard API response": detail.text,
+    }
+    violations = [
+        f"{name} exposed the mutation authorizer"
+        for name, content in serialized_surfaces.items()
+        if mutation_authorizer in content
+    ]
+
+    public_packets = {
+        "sanitized packet dict": packet,
+        "durable sanitized packet JSON": durable_packet,
+        "dashboard API response": dashboard_packet,
+    }
+    for name, public_packet in public_packets.items():
+        freshness = public_packet.get("freshness")
+        if (
+            not isinstance(freshness, dict)
+            or set(freshness) != {"created_at", "generation"}
+            or not isinstance(freshness.get("created_at"), int)
+            or not isinstance(freshness.get("generation"), int)
+            or freshness["generation"] < 1
+        ):
+            violations.append(
+                f"{name} freshness was not timestamp + public generation: "
+                f"{freshness!r}"
+            )
+
+    canonical_freshness = packet.get("freshness", {})
+    if "created_at" in canonical_freshness and "generation" in canonical_freshness:
+        for name, content in {
+            "formatted gateway text": gateway_text,
+            "PNG draw.text surface": "\n".join(rendered_png_text),
+        }.items():
+            if not all(
+                str(canonical_freshness[field]) in content
+                for field in ("created_at", "generation")
+            ):
+                violations.append(
+                    f"{name} omitted public timestamp/generation freshness evidence"
+                )
+
+    assert violations == []
 
 
 # ---------------------------------------------------------------------------
@@ -1228,5 +1371,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-

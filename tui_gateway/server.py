@@ -11372,7 +11372,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
+    "status", "archived", "unblocked", "block_loop_detected",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -11473,7 +11473,13 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             pass
 
 
-def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
+def _format_kanban_event_text(
+    sub: dict,
+    task,
+    ev,
+    board_slug: str,
+    approval_packet: Optional[dict] = None,
+) -> Optional[str]:
     """Single-line notification text for one kanban event.
 
     Wording mirrors the gateway notifier (gateway/kanban_watchers.py) so a
@@ -11489,6 +11495,18 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     who = getattr(task, "assignee", None) or ""
     tag = f"@{who} " if who else ""
     payload = getattr(ev, "payload", None) or {}
+    actionable_block = (
+        kind == "block_loop_detected"
+        or (kind == "blocked" and payload.get("kind") in ("needs_input", "capability"))
+    )
+    if actionable_block:
+        # Fail closed: an actionable human-decision event must never degrade
+        # into the old context-free "task blocked" notification.
+        if approval_packet is None:
+            return None
+        from hermes_cli.approval_packets import format_approval_packet_text
+
+        return format_approval_packet_text(approval_packet)
     if kind == "completed":
         handoff = ""
         summary = payload.get("summary")
@@ -11604,10 +11622,43 @@ def _collect_kanban_notifications(session: dict) -> list:
                 if not events:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
+                approval_packets: dict[int, dict] = {}
+                try:
+                    approval_packets = {
+                        int(packet["provenance"]["event_id"]): packet
+                        for packet in _kb.list_approval_packets(
+                            conn, task_id=sub["task_id"]
+                        )
+                        if packet["provenance"]["status"] == "open"
+                    }
+                except Exception:
+                    # Malformed durable packets are never rendered as generic
+                    # blocked text. The already-claimed cursor safely dedupes
+                    # the rejected notification.
+                    approval_packets = {}
                 for ev in events:
-                    text = _format_kanban_event_text(sub, task, ev, slug)
+                    packet = approval_packets.get(int(ev.id))
+                    text = _format_kanban_event_text(
+                        sub, task, ev, slug, approval_packet=packet
+                    )
                     if text:
-                        texts.append(text)
+                        if packet is None or _kb.begin_approval_delivery(
+                            conn,
+                            packet_id=packet["packet_id"],
+                            platform="tui",
+                            chat_id=session_key,
+                            thread_id=sub.get("thread_id") or "",
+                        ):
+                            texts.append(text)
+                            if packet is not None:
+                                _kb.finish_approval_delivery(
+                                    conn,
+                                    packet_id=packet["packet_id"],
+                                    platform="tui",
+                                    chat_id=session_key,
+                                    thread_id=sub.get("thread_id") or "",
+                                    media_status="not_supported",
+                                )
                 # Unsubscribe only on archive. ``done`` is reversible in
                 # review/controller flows, so retaining the subscription lets
                 # a later reopen notify the same originating TUI/Desktop
