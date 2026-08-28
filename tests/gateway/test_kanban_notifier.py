@@ -872,11 +872,14 @@ def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
             chat_type="dm",
             delivery_mode="notify+wake",
         )
-        kb._append_event(
-            conn, tid, "block_loop_detected",
-            {"reason": "needs credentials", "kind": "needs_input",
-             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
+        assert kb.block_task(
+            conn, tid, reason="needs credentials", kind="needs_input"
         )
+        assert kb.unblock_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, reason="needs credentials", kind="needs_input"
+        )
+        assert kb.get_task(conn, tid).status == "triage"
     finally:
         conn.close()
 
