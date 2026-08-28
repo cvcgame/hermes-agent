@@ -85,11 +85,7 @@ export function ApprovalRequiredPanel({ packet, text = en.approval }: ApprovalRe
   const waiting = packet.impact.waiting_count
 
   return (
-    <section
-      aria-label={text.required}
-      className="border-l-2 border-(--ui-accent) pl-3"
-      role="region"
-    >
+    <section aria-label={text.required} className="border-l-2 border-(--ui-accent) pl-3" role="region">
       <div className="mb-2 flex items-center gap-2">
         <Codicon className="text-(--ui-accent)" name="warning" size="0.9rem" />
         <h3 className="text-[0.78rem] font-semibold text-(--ui-accent)">{text.required}</h3>
@@ -127,9 +123,7 @@ export function ApprovalRequiredPanel({ packet, text = en.approval }: ApprovalRe
       </ol>
 
       <div className="mt-3 text-[0.65rem] text-(--ui-text-quaternary)">
-        <p>
-          {`${text.evidence}: ${packet.evidence.map(item => `${item.ref} (${item.label})`).join(' · ')}`}
-        </p>
+        <p>{`${text.evidence}: ${packet.evidence.map(item => `${item.ref} (${item.label})`).join(' · ')}`}</p>
         {packet.attachments.length > 0 ? (
           <p>
             {`${text.attachments}: ${packet.attachments
