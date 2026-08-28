@@ -169,6 +169,56 @@ def _event_ts(ev) -> int:
     return int(t or 0)
 
 
+_DECOMPOSITION_INTENT_BOUNDARIES = frozenset({
+    "approval_decided",
+    "archived",
+    "blocked",
+    "block_loop_detected",
+    "completed",
+    "decomposed",
+    "dependency_wait",
+    "promoted",
+    "promoted_manual",
+    "specified",
+    "status",
+    "unblocked",
+    "decomposition_requested",
+})
+
+
+def _has_current_decomposition_intent(events: Iterable[Any]) -> bool:
+    """Infer explicit fan-out intent from the ordered task event stream.
+
+    Diagnostics does not receive approval-packet rows, so it cannot reproduce
+    the durable authorization check. It instead fails closed: only a strictly
+    shaped ``decomposition_requested`` event is active, and every later task
+    lifecycle boundary that can supersede, resolve, or consume that request
+    clears it. Callers provide events in task-event order.
+    """
+    active = False
+    for event in events:
+        kind = _event_kind(event)
+        if kind not in _DECOMPOSITION_INTENT_BOUNDARIES:
+            continue
+        active = False
+        if kind != "decomposition_requested":
+            continue
+        payload = _parse_payload(event)
+        if type(payload) is not dict:
+            continue
+        generation = payload.get("generation")
+        active = (
+            set(payload) == {"packet_id", "generation", "choice"}
+            and isinstance(payload.get("packet_id"), str)
+            and bool(payload["packet_id"].strip())
+            and not isinstance(generation, bool)
+            and isinstance(generation, int)
+            and generation >= 1
+            and payload.get("choice") in {"A", "B", "C", "D"}
+        )
+    return active
+
+
 def _active_hallucination_events(
     events: Iterable[Any],
     kind: str,
@@ -270,7 +320,8 @@ def triage_aux_status(config: Optional[dict]) -> Optional[dict]:
     to avoid noisy false positives in tests / low-level callers). Otherwise
     returns a dict with:
 
-      - ``auto_decompose``: bool — whether the dispatcher auto-runs decompose
+      - ``auto_decompose``: bool — whether the dispatcher consumes explicit
+        decomposition intent
       - ``decomposer_explicit``: bool — user-supplied decomposer slot
       - ``specifier_explicit``: bool — user-supplied specifier slot
       - ``main_model_visible``: bool — main model can serve as auto fallback
@@ -370,13 +421,13 @@ def _rule_hallucinated_cards(task, events, runs, now, cfg) -> list[Diagnostic]:
 
 
 def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """A triage task cannot leave triage without an auxiliary helper.
+    """Diagnose an unavailable auxiliary helper for actionable triage work.
 
     With the auto-decompose dispatcher (kanban.auto_decompose, default True),
-    triage tasks fan out via ``auxiliary.kanban_decomposer`` and fall back to
-    ``auxiliary.triage_specifier`` when the decomposer returns ``fanout=false``.
-    With auto-decompose off, the user must run ``hermes kanban specify``,
-    which only needs ``auxiliary.triage_specifier``.
+    only a task carrying current explicit decomposition intent is waiting for
+    ``auxiliary.kanban_decomposer``. With auto-decompose off, the existing
+    manual ``hermes kanban specify`` diagnostic remains based on
+    ``auxiliary.triage_specifier``.
 
     The default slot is ``provider: auto`` → auto-falls back to the main model,
     so this rule only fires when:
@@ -398,6 +449,9 @@ def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnosti
     specifier_explicit = bool(status.get("specifier_explicit"))
     main_visible = bool(status.get("main_model_visible"))
 
+    if auto_decompose and not _has_current_decomposition_intent(events):
+        return []
+
     # Determine the primary slot and whether it is usable.
     if auto_decompose:
         primary_slot = "auxiliary.kanban_decomposer"
@@ -406,7 +460,8 @@ def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnosti
         fallback_explicit = specifier_explicit
         primary_desc = "decomposer"
         detail_path = (
-            "Auto-decompose is on, so the dispatcher needs "
+            "This task has current explicit decomposition intent, so the "
+            "auto-decompose dispatcher needs "
             "auxiliary.kanban_decomposer (with auxiliary.triage_specifier as "
             "a fallback for non-fan-out tasks)."
         )

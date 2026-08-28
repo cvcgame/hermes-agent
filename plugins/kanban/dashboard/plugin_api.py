@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -571,6 +572,23 @@ def get_task(
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
+        approval = kanban_db.get_active_approval_packet(conn, task_id)
+        if approval is not None:
+            # The renderer path is gateway-internal provenance and may contain
+            # a local username/home path. The drawer never needs it.
+            approval["provenance"].pop("card_path", None)
+            approval["deliveries"] = [
+                {
+                    "platform": row["platform"],
+                    "status": row["status"],
+                    "delivered_at": row["delivered_at"],
+                    "read_at": row["read_at"],
+                    "media_status": row["media_status"],
+                }
+                for row in kanban_db.list_approval_deliveries(
+                    conn, packet_id=approval["packet_id"]
+                )
+            ]
         return {
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
@@ -587,7 +605,54 @@ def get_task(
                     state_name=run_state_name,
                 )
             ],
+            "approval": approval,
         }
+    finally:
+        conn.close()
+
+
+class ApprovalReadBody(BaseModel):
+    packet_id: str = Field(min_length=1, max_length=160)
+    reader_id: str = Field(default="desktop-drawer", min_length=1, max_length=160)
+
+
+@router.post("/tasks/{task_id}/approval/read")
+def mark_task_approval_read(
+    task_id: str,
+    payload: ApprovalReadBody,
+    board: Optional[str] = Query(None),
+):
+    """Record drawer readback without applying or implying a decision."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        packet = kanban_db.get_active_approval_packet(conn, task_id)
+        if packet is None:
+            raise HTTPException(status_code=404, detail="no active approval")
+        if packet["packet_id"] != payload.packet_id:
+            raise HTTPException(status_code=409, detail="stale approval packet")
+        reader = hashlib.sha256(payload.reader_id.encode("utf-8")).hexdigest()[:24]
+        claimed = kanban_db.begin_approval_delivery(
+            conn,
+            packet_id=payload.packet_id,
+            platform="desktop",
+            chat_id=f"drawer:{reader}",
+        )
+        if claimed:
+            kanban_db.finish_approval_delivery(
+                conn,
+                packet_id=payload.packet_id,
+                platform="desktop",
+                chat_id=f"drawer:{reader}",
+                media_status="not_supported",
+            )
+        read = kanban_db.mark_approval_read(
+            conn,
+            packet_id=payload.packet_id,
+            platform="desktop",
+            chat_id=f"drawer:{reader}",
+        )
+        return {"read": read, "packet_id": payload.packet_id}
     finally:
         conn.close()
 

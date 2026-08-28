@@ -1226,8 +1226,10 @@ DEFAULT_CONFIG = {
         },
         # Kanban decomposer — decomposes a triage task into a graph of
         # child tasks routed to specialist profiles by description.
-        # Invoked by ``hermes kanban decompose`` and the kanban
-        # auto-decompose dispatcher tick. Returns a JSON task graph;
+        # Invoked directly by ``hermes kanban decompose`` or by the dispatcher
+        # for explicit current-generation decomposition intent.
+        # It does not fan out ordinary triage tasks or ordinary approval choices.
+        # Returns a JSON task graph;
         # uses more tokens than the specifier so allow more headroom.
         "kanban_decomposer": {
             "provider": "auto",
@@ -2803,14 +2805,15 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
-        # When true, the kanban dispatcher auto-runs the decomposer on
-        # tasks that land in Triage (every dispatcher tick). When false,
-        # decomposition is manual via `hermes kanban decompose <id>` or
-        # the dashboard's Decompose button.
+        # When true, the dispatcher consumes only explicit current-generation
+        # decomposition intent created by a deliberate Decompose approval.
+        # It does not fan out ordinary triage tasks or ordinary approval choices.
+        # When false, that automatic consumption is disabled. Direct
+        # `hermes kanban decompose <id>` / `--all`, dashboard Decompose, and
+        # manual Specify actions remain available in either mode.
         "auto_decompose": True,
-        # Max triage tasks to decompose per dispatcher tick. Prevents a
-        # large bulk-load of triage tasks from spending a burst of aux
-        # LLM calls in one tick. Excess tasks defer to the next tick.
+        # Max current explicit intents consumed per dispatcher tick. Excess
+        # approved requests defer to the next tick.
         "auto_decompose_per_tick": 3,
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are

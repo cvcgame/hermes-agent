@@ -456,8 +456,16 @@ def decompose_task(
     )
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+def list_triage_ids(
+    *,
+    tenant: Optional[str] = None,
+    require_decomposition_intent: bool = True,
+) -> list[str]:
+    """Return triage ids safe for automatic or explicit decomposition.
+
+    Automatic callers use the fail-closed default. The human CLI's explicit
+    ``decompose --all`` passes ``False`` to opt into ordinary triage rows.
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -465,4 +473,9 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+        return [
+            row.id
+            for row in rows
+            if not require_decomposition_intent
+            or kb.has_current_decomposition_intent(conn, row.id)
+        ]

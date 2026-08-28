@@ -209,6 +209,119 @@ def _triage_task():
     return _task(id="t_triage1", status="triage")
 
 
+_UNUSABLE_AUTO_DECOMPOSER = {
+    "triage_aux_status": {
+        "auto_decompose": True,
+        "decomposer_explicit": False,
+        "specifier_explicit": False,
+        "main_model_visible": False,
+    },
+}
+
+
+def test_ordinary_triage_without_current_intent_is_not_waiting_on_decomposer():
+    diags = kd.compute_task_diagnostics(
+        _triage_task(),
+        [],
+        [],
+        config=_UNUSABLE_AUTO_DECOMPOSER,
+    )
+
+    assert not [d for d in diags if d.kind == "triage_aux_unavailable"]
+
+
+def test_current_generation_decompose_intent_diagnoses_unusable_decomposer():
+    events = [
+        _event(
+            "decomposition_requested",
+            packet_id="appr_current",
+            generation=3,
+            choice="A",
+        ),
+    ]
+
+    diags = kd.compute_task_diagnostics(
+        _triage_task(),
+        events,
+        [],
+        config=_UNUSABLE_AUTO_DECOMPOSER,
+    )
+
+    unavailable = [d for d in diags if d.kind == "triage_aux_unavailable"]
+    assert len(unavailable) == 1
+    assert unavailable[0].data["primary_slot"] == "auxiliary.kanban_decomposer"
+
+
+@pytest.mark.parametrize(
+    "superseding_kind",
+    ["blocked", "unblocked", "approval_decided", "decomposed"],
+)
+def test_later_lifecycle_event_invalidates_decompose_intent(superseding_kind):
+    events = [
+        _event(
+            "decomposition_requested",
+            packet_id="appr_stale",
+            generation=2,
+            choice="A",
+        ),
+        _event(superseding_kind),
+    ]
+
+    diags = kd.compute_task_diagnostics(
+        _triage_task(),
+        events,
+        [],
+        config=_UNUSABLE_AUTO_DECOMPOSER,
+    )
+
+    assert not [d for d in diags if d.kind == "triage_aux_unavailable"]
+
+
+def test_manual_mode_still_diagnoses_unusable_specifier_without_auto_intent():
+    config = {
+        "triage_aux_status": {
+            "auto_decompose": False,
+            "decomposer_explicit": False,
+            "specifier_explicit": False,
+            "main_model_visible": False,
+        },
+    }
+
+    diags = kd.compute_task_diagnostics(
+        _triage_task(),
+        [],
+        [],
+        config=config,
+    )
+
+    unavailable = [d for d in diags if d.kind == "triage_aux_unavailable"]
+    assert len(unavailable) == 1
+    assert unavailable[0].data["primary_slot"] == "auxiliary.triage_specifier"
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "website/docs/user-guide/features/kanban.md",
+        "website/docs/user-guide/features/kanban-tutorial.md",
+        "website/docs/reference/cli-commands.md",
+        "hermes_cli/config_defaults.py",
+    ],
+)
+def test_auto_decompose_authoritative_surfaces_state_explicit_intent_boundary(
+    relative_path,
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    text = (repo_root / relative_path).read_text(encoding="utf-8").casefold()
+    required_claims = (
+        "explicit current-generation decomposition intent",
+        "does not fan out ordinary triage tasks or ordinary approval choices",
+    )
+
+    missing = [claim for claim in required_claims if claim not in text]
+    assert not missing, f"{relative_path} is missing Auto boundary claims: {missing}"
+
+
 
 
 

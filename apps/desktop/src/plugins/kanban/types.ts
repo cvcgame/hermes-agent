@@ -91,6 +91,59 @@ export interface KanbanAttachment {
   size?: null | number
 }
 
+export interface ApprovalChoice {
+  id: 'A' | 'B' | 'C' | 'D'
+  label: string
+  tradeoff: string
+  recommended: boolean
+  action?: 'resume' | 'keep_blocked' | 'decompose'
+  assignee?: string
+}
+
+export interface ApprovalPacket {
+  schema_version: 'approval_packet.v1'
+  packet_id: string
+  task_id: string
+  board_slug: string
+  title: string
+  decision_question: string
+  why_blocked: string
+  block_kind?: null | string
+  completed_state: string
+  evidence: Array<{ ref: string; kind: string; label: string }>
+  attachments: Array<{
+    id: number | string
+    filename: string
+    content_type?: null | string
+    size?: null | number
+  }>
+  impact: {
+    waiting_count: number
+    dependents: Array<{ task_id: string; title: string; status: string }>
+  }
+  choices: ApprovalChoice[]
+  reply_syntax: { short: string; command: string }
+  freshness: { created_at: number; generation: number }
+  redaction_attestations: {
+    bounded: boolean
+    pii_redacted: boolean
+    secrets_redacted: boolean
+  }
+  provenance: {
+    event_id: number
+    event_kind: string
+    status: string
+    decision?: null | { choice: string; actor: string; received_at: number }
+  }
+  deliveries: Array<{
+    platform: string
+    status: string
+    delivered_at?: null | number
+    read_at?: null | number
+    media_status?: null | string
+  }>
+}
+
 /** Fields present only on the detail endpoint (beyond the card's KanbanTask).
  *  `started_at`/`worker_pid`/`last_heartbeat_at` are inherited — they live on
  *  KanbanTask now that the board's liveness arc reads them. */
@@ -120,6 +173,7 @@ export interface KanbanTaskDetail {
   attachments: KanbanAttachment[]
   links: { parents: string[]; children: string[] }
   runs: KanbanRun[]
+  approval?: null | ApprovalPacket
 }
 
 /** GET /boards — every board on disk + which one is the server's current. */

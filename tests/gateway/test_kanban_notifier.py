@@ -24,6 +24,31 @@ class RecordingAdapter:
         self.handled.append(event)
 
 
+class ApprovalMediaAdapter(RecordingAdapter):
+    def __init__(self, *, media_success=True):
+        super().__init__()
+        self.media_success = media_success
+        self.images = []
+
+    async def send(self, chat_id, text, metadata=None):
+        from gateway.platforms.base import SendResult
+
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return SendResult(success=True, message_id="text-1")
+
+    async def send_image_file(self, chat_id, image_path, caption=None, metadata=None, **kwargs):
+        from gateway.platforms.base import SendResult
+
+        self.images.append(
+            {"chat_id": chat_id, "image_path": image_path, "caption": caption, "metadata": metadata or {}}
+        )
+        return SendResult(
+            success=self.media_success,
+            message_id="media-1" if self.media_success else None,
+            error=None if self.media_success else "photo failed",
+        )
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -166,6 +191,146 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     message = adapter.sent[0]["text"]
     assert tid in message
     assert "blocked" in message
+
+
+def test_actionable_telegram_block_sends_packet_text_and_png(tmp_path, monkeypatch):
+    db_path = tmp_path / "approval-media.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="Choose rollout", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(
+            conn,
+            tid,
+            reason="Canary or all at once?",
+            kind="needs_input",
+            board_slug="main",
+        )
+    finally:
+        conn.close()
+
+    adapter = ApprovalMediaAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "Approval required" in adapter.sent[0]["text"]
+    assert "Decision:" in adapter.sent[0]["text"]
+    assert "A." in adapter.sent[0]["text"]
+    assert len(adapter.images) == 1
+    assert Path(adapter.images[0]["image_path"]).read_bytes().startswith(b"\x89PNG")
+    conn = kb.connect()
+    try:
+        packet = kb.get_active_approval_packet(conn, tid)
+        deliveries = kb.list_approval_deliveries(conn, packet_id=packet["packet_id"])
+    finally:
+        conn.close()
+    assert deliveries[0]["status"] == "delivered"
+    assert deliveries[0]["media_status"] == "delivered"
+
+
+def test_telegram_media_failure_keeps_text_fallback_and_dedupes(tmp_path, monkeypatch):
+    db_path = tmp_path / "approval-media-fail.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="Choose rollout", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(
+            conn,
+            tid,
+            reason="Canary or all at once?",
+            kind="capability",
+            board_slug="main",
+        )
+    finally:
+        conn.close()
+
+    adapter = ApprovalMediaAdapter(media_success=False)
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "Approval required" in adapter.sent[0]["text"]
+    assert len(adapter.images) == 1
+    conn = kb.connect()
+    try:
+        packet = kb.get_active_approval_packet(conn, tid)
+        delivery = kb.list_approval_deliveries(conn, packet_id=packet["packet_id"])[0]
+    finally:
+        conn.close()
+    assert delivery["status"] == "delivered"
+    assert delivery["media_status"] == "failed"
+
+
+def test_tampered_card_path_cannot_send_arbitrary_local_file(tmp_path, monkeypatch):
+    db_path = tmp_path / "approval-media-path.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    outside = tmp_path / "private-image.png"
+    outside.write_bytes(b"\x89PNG\r\n\x1a\nprivate")
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="Choose rollout", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Canary or all at once?",
+            kind="needs_input",
+        )
+        packet = kb.get_active_approval_packet(conn, tid)
+        conn.execute(
+            "UPDATE approval_packets SET card_path = ? WHERE packet_id = ?",
+            (str(outside), packet["packet_id"]),
+        )
+    finally:
+        conn.close()
+
+    adapter = ApprovalMediaAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.images == []
+    conn = kb.connect()
+    try:
+        delivery = kb.list_approval_deliveries(conn, packet_id=packet["packet_id"])[0]
+    finally:
+        conn.close()
+    assert delivery["status"] == "delivered"
+    assert delivery["media_status"] == "failed"
+
+
+def test_notifier_sends_only_current_packet_when_reblock_events_are_claimed_together(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "superseded-packet.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="reblocked", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.block_task(conn, tid, reason="first request", kind="needs_input")
+        assert kb.unblock_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="current request", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = ApprovalMediaAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "Approval required" in adapter.sent[0]["text"]
+    assert "current request" in adapter.sent[0]["text"]
+    assert "first request" not in adapter.sent[0]["text"]
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
@@ -576,16 +741,7 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
 
 
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
-    """A `block_loop_detected` event must reach the subscriber as a triage ping.
-
-    Regression for the silent-triage gap (PR #62712): kanban_db routes a task
-    to `triage` after BLOCK_RECURRENCE_LIMIT re-blocks for the same cause and
-    emits ONLY a `block_loop_detected` event — no `blocked`/`status` event.
-    Before `block_loop_detected` joined TERMINAL_KINDS with its own message
-    branch, that one transition (the whole point of which is to force human
-    attention) produced zero notification and the task stalled in triage
-    silently.
-    """
+    """The real loop transition delivers its structured current packet."""
     db_path = tmp_path / "block-loop.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -594,11 +750,14 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     try:
         tid = kb.create_task(conn, title="loops forever", assignee="worker")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
-        kb._append_event(
-            conn, tid, "block_loop_detected",
-            {"reason": "needs credentials", "kind": "needs_input",
-             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
+        assert kb.block_task(
+            conn, tid, reason="needs credentials", kind="needs_input"
         )
+        assert kb.unblock_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, reason="needs credentials", kind="needs_input"
+        )
+        assert kb.get_task(conn, tid).status == "triage"
     finally:
         conn.close()
 
@@ -607,9 +766,9 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
+    assert len(adapter.sent) == 1, "block_loop_detected must produce an approval notification"
     text = adapter.sent[0]["text"]
-    assert "TRIAGE" in text
+    assert "Approval required" in text
     assert tid in text
     assert "needs credentials" in text
     # Cursor advanced: the event is claimed and not re-delivered.
@@ -713,11 +872,14 @@ def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
             chat_type="dm",
             delivery_mode="notify+wake",
         )
-        kb._append_event(
-            conn, tid, "block_loop_detected",
-            {"reason": "needs credentials", "kind": "needs_input",
-             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
+        assert kb.block_task(
+            conn, tid, reason="needs credentials", kind="needs_input"
         )
+        assert kb.unblock_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, reason="needs credentials", kind="needs_input"
+        )
+        assert kb.get_task(conn, tid).status == "triage"
     finally:
         conn.close()
 

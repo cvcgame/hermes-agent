@@ -54,6 +54,73 @@ def _sub_rows(tid: str) -> list:
 
 
 class TestCollectKanbanNotifications:
+    def test_dependency_wait_is_silent_and_has_no_approval_packet(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            assert kb.block_task(
+                conn, tid, reason="waiting for parent", kind="dependency"
+            )
+            assert kb.list_approval_packets(conn, task_id=tid) == []
+        finally:
+            conn.close()
+
+        assert _collect_kanban_notifications(_session()) == []
+
+    def test_needs_input_uses_actionable_approval_packet_text(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            assert kb.block_task(
+                conn,
+                tid,
+                reason="Choose the release channel",
+                kind="needs_input",
+                approval={
+                    "decision_question": "Which release channel should be used?",
+                    "choices": [
+                        {
+                            "id": "A",
+                            "label": "Stable",
+                            "tradeoff": "Lower rollout risk",
+                            "recommended": True,
+                        },
+                        {
+                            "id": "B",
+                            "label": "Preview",
+                            "tradeoff": "Earlier feedback, more risk",
+                            "recommended": False,
+                        },
+                    ],
+                },
+            )
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1
+        assert "Approval required" in texts[0]
+        assert "Which release channel" in texts[0]
+        assert "A. Stable (recommended)" in texts[0]
+
+    def test_block_loop_detected_uses_actionable_approval_packet_text(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            assert kb.block_task(conn, tid, reason="same blocker", kind="capability")
+            assert kb.unblock_task(conn, tid)
+            assert kb.block_task(conn, tid, reason="same blocker", kind="capability")
+            assert kb.get_task(conn, tid).status == "triage"
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1
+        assert "Approval required" in texts[0]
+        assert "same blocker" in texts[0]
+
     def test_zero_sub_board_is_never_opened_writable(self):
         conn = kb.connect()
         conn.close()

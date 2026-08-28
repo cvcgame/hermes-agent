@@ -31,6 +31,44 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None):
     )
 
 
+def _create_resolved_ordinary_triage(conn) -> str:
+    task_id = kb.create_task(conn, title="operator-owned root", assignee="worker")
+    assert kb.block_task(
+        conn,
+        task_id,
+        kind="needs_input",
+        reason="Choose the delivery plan.",
+    )
+    assert kb.unblock_task(conn, task_id)
+    assert kb.block_task(
+        conn,
+        task_id,
+        kind="needs_input",
+        reason="Choose the delivery plan again.",
+    )
+    packet = kb.get_active_approval_packet(conn, task_id)
+    assert packet is not None
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE approval_packets SET status = 'decided', "
+            "decision_choice = 'B', decision_actor = 'operator' "
+            "WHERE packet_id = ?",
+            (packet["packet_id"],),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "approval_decided",
+            {
+                "packet_id": packet["packet_id"],
+                "choice": "B",
+                "action": "keep_blocked",
+            },
+        )
+    assert kb.get_task(conn, task_id).status == "triage"
+    return task_id
+
+
 def test_specify_promotes_triage_to_todo(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn, title="rough idea")
@@ -79,3 +117,29 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
     assert comments2 == []
 
 
+def test_auto_specifier_rejects_resolved_triage_without_decompose_intent(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = _create_resolved_ordinary_triage(conn)
+        before = kb.get_task(conn, task_id)
+        before_comments = kb.list_comments(conn, task_id)
+        before_events = kb.list_events(conn, task_id)
+
+        ok = kb.specify_triage_task(
+            conn,
+            task_id,
+            title="Unsafe automatic rewrite",
+            body="This update came from a stale automatic candidate.",
+            assignee="auto-owner",
+            author="auto-decomposer",
+        )
+
+        assert ok is False
+        after = kb.get_task(conn, task_id)
+        assert after.status == before.status == "triage"
+        assert after.title == before.title
+        assert after.body == before.body
+        assert after.assignee == before.assignee
+        assert kb.list_comments(conn, task_id) == before_comments
+        assert kb.list_events(conn, task_id) == before_events
